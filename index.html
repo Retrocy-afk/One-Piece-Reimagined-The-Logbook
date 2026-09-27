@@ -628,20 +628,7 @@
 </style>
 </head>
 <body>
-<div class="login-screen" id="passwordGateScreen">
-  <div class="login-card">
-    <div class="brand" style="justify-content:center; margin-bottom:18px;">
-      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2"/><path d="M12 12l4-6-6 4-2 6 4-4z" fill="currentColor" stroke="none"/></svg>
-      <div class="brand-text"><strong>The Logbook</strong><span>post-timeskip worldbuilding</span></div>
-    </div>
-    <h2 style="text-align:center; font-size:19px; margin-bottom:4px;">This site is invite-only</h2>
-    <p style="text-align:center; font-size:13px; color:var(--color-text-dim); margin:0 0 20px 0;">Enter the access password to continue. You'll only need to do this once on this device.</p>
-    <div class="field"><label for="gatePasswordInput">Password</label><input id="gatePasswordInput" type="password" placeholder="Enter password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
-    <p id="gatePasswordError" class="hidden" style="color:var(--color-coral); font-size:12.5px; margin:-8px 0 14px 0;">That password isn't right — try again.</p>
-    <button class="btn btn-primary" id="gateContinueBtn" style="width:100%; justify-content:center;">Unlock</button>
-  </div>
-</div>
-<div class="login-screen hidden" id="loginScreen">
+<div class="login-screen" id="loginScreen">
   <div class="login-card">
     <div class="brand" style="justify-content:center; margin-bottom:18px;">
       <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2"/><path d="M12 12l4-6-6 4-2 6 4-4z" fill="currentColor" stroke="none"/></svg>
@@ -1659,7 +1646,7 @@ Feel free to look at what we wrote/worked on so far!</div>
     const file = e.target.files[0];
     e.target.value = "";
     if (!file) return;
-    try { draftLoginAvatar = await resizeImageFile(file); renderLoginAvatarPreview(); }
+    try { draftLoginAvatar = await resizeAndUploadImage(file, "avatars"); renderLoginAvatarPreview(); }
     catch(err){ console.error(err); }
   });
   document.getElementById("loginContinueBtn").addEventListener("click", ()=>{
@@ -2176,14 +2163,14 @@ Feel free to look at what we wrote/worked on so far!</div>
     e.preventDefault(); topicThumbZone.style.background = "";
     const file = e.dataTransfer.files[0];
     if (file && file.type.startsWith("image/")) {
-      try { draftTopicThumb = await resizeImageFile(file); renderTopicThumbPreview(); } catch(err){ console.error(err); }
+      try { draftTopicThumb = await resizeAndUploadImage(file, "thumbnails"); renderTopicThumbPreview(); } catch(err){ console.error(err); }
     }
   });
   topicThumbInput.addEventListener("change", async e=>{
     const file = e.target.files[0];
     topicThumbInput.value = "";
     if (file) {
-      try { draftTopicThumb = await resizeImageFile(file); renderTopicThumbPreview(); } catch(err){ console.error(err); }
+      try { draftTopicThumb = await resizeAndUploadImage(file, "thumbnails"); renderTopicThumbPreview(); } catch(err){ console.error(err); }
     }
   });
 
@@ -2259,7 +2246,7 @@ Feel free to look at what we wrote/worked on so far!</div>
     rteImageInput.value = "";
     if (!file) return;
     try {
-      const dataUrl = await resizeImageFile(file);
+      const dataUrl = await resizeAndUploadImage(file, "inline");
       rteRestoreRange();
       document.execCommand("insertImage", false, dataUrl);
     } catch(err){ console.error(err); }
@@ -3355,6 +3342,57 @@ ${dataStr}
     });
   }
 
+  /* ---------------- Image storage (Supabase Storage) ----------------
+     Images are uploaded as real files to a Supabase Storage bucket and
+     only a short URL string is kept in the synced state, instead of the
+     full image being embedded as base64 inside that state. The app
+     polls the whole state every few seconds per open tab, so embedding
+     images directly would mean re-downloading every image, in full, on
+     every poll, for every open tab — this is what was eating through
+     Supabase's free bandwidth allowance after only a handful of images.
+     A URL is a few dozen bytes regardless of how large the image behind
+     it is, and the <img> tag loads (and the browser caches) that image
+     separately from the polling loop, so it's only fetched when it's
+     actually first displayed, not every 7 seconds.
+     Requires a public Storage bucket named exactly IMAGE_BUCKET with an
+     "insert" policy for anon uploads (see the setup guide). Falls back
+     to the old inline-base64 behavior in local-only mode (no Supabase
+     configured) or if the upload itself fails, so nothing is lost —
+     it's just bigger than it needs to be in that case. */
+  const IMAGE_BUCKET = "logbook-images";
+
+  function dataUrlToBlob(dataUrl){
+    return fetch(dataUrl).then(r => r.blob());
+  }
+
+  async function uploadImageDataUrl(dataUrl, prefix){
+    if (!SUPABASE_CONFIGURED) return dataUrl;
+    try {
+      const blob = await dataUrlToBlob(dataUrl);
+      const ext = blob.type === "image/png" ? "png" : "jpg";
+      const path = `${prefix}/${uid()}.${ext}`;
+      const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${IMAGE_BUCKET}/${path}`, {
+        method: "POST",
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          "Content-Type": blob.type || "image/jpeg"
+        },
+        body: blob
+      });
+      if (!res.ok) throw new Error("Storage upload failed: " + res.status);
+      return `${SUPABASE_URL}/storage/v1/object/public/${IMAGE_BUCKET}/${path}`;
+    } catch(e) {
+      console.error("Image upload to Supabase Storage failed, keeping it inline instead:", e);
+      return dataUrl;
+    }
+  }
+
+  async function resizeAndUploadImage(file, prefix){
+    const dataUrl = await resizeImageFile(file);
+    return uploadImageDataUrl(dataUrl, prefix);
+  }
+
   let designSearchTerm = "";
   function renderDesigns(){
     const grid = document.getElementById("designGrid");
@@ -3515,7 +3553,7 @@ ${dataStr}
     const files = Array.from(fileList||[]).filter(f=>f.type.startsWith("image/"));
     for (const file of files) {
       try {
-        const dataUrl = await resizeImageFile(file);
+        const dataUrl = await resizeAndUploadImage(file, "designs");
         draftImages.push({ id: uid(), dataUrl });
         renderImgThumbs();
       } catch(e){ console.error("Could not read image:", e); }
@@ -3644,55 +3682,17 @@ ${dataStr}
     });
   });
 
-  /* ---------------- Site access gate (one-time password, this device) ---------------- */
-  const GATE_PASSWORD = "OnePieceRecharted!@#123";
-  const GATE_UNLOCKED_KEY = "owb_gate_unlocked";
-  function isGateUnlocked(){
-    try { return localStorage.getItem(GATE_UNLOCKED_KEY) === "1"; } catch(e){ return false; }
-  }
-  function unlockGate(){
-    try { localStorage.setItem(GATE_UNLOCKED_KEY, "1"); } catch(e){}
-  }
-  function passGate(){
-    document.getElementById("passwordGateScreen").classList.add("hidden");
-    document.getElementById("loginScreen").classList.remove("hidden");
-    startApp();
-  }
-  function attemptUnlock(){
-    const input = document.getElementById("gatePasswordInput");
-    if (input.value.trim() === GATE_PASSWORD) {
-      unlockGate();
-      passGate();
-    } else {
-      document.getElementById("gatePasswordError").classList.remove("hidden");
-      input.value = "";
-      input.focus();
-    }
-  }
-  document.getElementById("gateContinueBtn").addEventListener("click", attemptUnlock);
-  document.getElementById("gatePasswordInput").addEventListener("keydown", e=>{
-    if (e.key === "Enter") { e.preventDefault(); attemptUnlock(); }
-  });
-
   /* ---------------- Init ---------------- */
-  function startApp(){
-    try {
-      const savedTheme = localStorage.getItem("owb_theme");
-      applyTheme(savedTheme || "");
-    } catch(e) { applyTheme(""); }
-    loadProfile();
-    if (profile) { enterApp(); } else { showLoginScreen(); }
-    load().then(()=>{
-      showView("dashboard");
-      startPolling();
-    });
-  }
-
-  if (isGateUnlocked()) {
-    passGate();
-  } else {
-    document.getElementById("gatePasswordInput").focus();
-  }
+  try {
+    const savedTheme = localStorage.getItem("owb_theme");
+    applyTheme(savedTheme || "");
+  } catch(e) { applyTheme(""); }
+  loadProfile();
+  if (profile) { enterApp(); } else { showLoginScreen(); }
+  load().then(()=>{
+    showView("dashboard");
+    startPolling();
+  });
 
 })();
 </script>
